@@ -3,39 +3,59 @@ Playground script for evaluating LLMs (e.g., Qwen3-14B) on HAMD-13 datasets.
 This script performs zero-shot evaluation of large language models on depression assessment tasks.
 
 Usage:
-    # Evaluate on EvaluateTape dataset
-    python playground_HAMD13.py --dataset evaluatetape
+    # Evaluate on CIDH or PDCH dataset (all data)
+    python playground_HAMD13_all.py --dataset cidh
     
-    # Evaluate on PDCH dataset
-    python playground_HAMD13.py --dataset pdch
+    # Custom output file
+    python playground_HAMD13_all.py --dataset cidh --output my_results.xlsx
 """
 
 import argparse
 import os
 import json
-import numpy as np
+import re
+import pandas as pd
 from typing import List, Dict
 from tqdm import tqdm
+from openai import OpenAI
 
 
-def load_hamd13_data(dataset_name: str = "evaluatetape", split: str = "test"):
+# Subscale names for HAMD-13
+SUBSCALE_NAMES = [
+    "Guilt", "Suicide", "Insomnia_Initial", "Insomnia_Middle", "Insomnia_Late",
+    "Work_Interests", "Psychic_Anxiety", "GI_Symptoms", "Somatic_Symptoms",
+    "Genital_Symptoms", "Hypochondriasis", "Weight_Loss", "Insight"
+]
+
+
+client = OpenAI(
+    api_key="not-needed",
+    base_url="http://localhost:8001/v1"
+)
+
+
+MODEL_NAME = "qwen3-14B"
+
+
+def load_hamd13_data(dataset_name: str = "cidh"):
     """
-    Load HAMD-13 dataset.
+    Load HAMD-13 dataset from all.json file.
     
     Args:
-        dataset_name: "evaluatetape" or "pdch"
-        split: "train", "val", or "test"
+        dataset_name: "cidh" or "pdch"
     
     Returns:
         List of samples with transcript and scores
     """
-    data_dir = "../data"
+    # Use relative path from script location
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "data")
     
-    if dataset_name.lower() == "evaluatetape":
-        # EvaluateTape dataset (summarized format)
-        file_path = os.path.join(data_dir, "evaluatetape", f"eval_summary_{split}.json")
+    if dataset_name.lower() == "cidh":
+        # cidh dataset - use all.json
+        file_path = os.path.join(data_dir, "cidh", "cidh_summary_all.json")
     elif dataset_name.lower() == "pdch":
-        file_path = os.path.join(data_dir, "pdch", f"pdch_original_{split}.json")
+        file_path = os.path.join(data_dir, "pdch", "pdch_summary_all.json")
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
@@ -48,104 +68,204 @@ def load_hamd13_data(dataset_name: str = "evaluatetape", split: str = "test"):
     return data
 
 
-def calculate_mae_rmse(predictions: List[List[int]], ground_truth: List[List[int]]):
-    """
-    Calculate MAE and RMSE for subscales and total score.
+def validate_scores(scores: List[int]) -> List[int]:
+    max_scores = [4, 4, 2, 2, 2, 4, 4, 2, 2, 2, 4, 2, 2]
     
-    Args:
-        predictions: List of predicted scores for each sample
-        ground_truth: List of ground truth scores for each sample
+    validated = []
+    for i, score in enumerate(scores[:13]):
+        max_val = max_scores[i] if i < len(max_scores) else 2
+        validated.append(max(0, min(max_val, int(score))))
+    while len(validated) < 13:
+        validated.append(0)
     
-    Returns:
-        Dictionary with MAE and RMSE metrics
-    """
-    predictions = np.array(predictions)
-    ground_truth = np.array(ground_truth)
-    
-    # Per-subscale metrics
-    subscale_mae = np.mean(np.abs(predictions - ground_truth), axis=0)
-    subscale_rmse = np.sqrt(np.mean((predictions - ground_truth) ** 2, axis=0))
-    
-    # Total score metrics
-    pred_total = predictions.sum(axis=1)
-    true_total = ground_truth.sum(axis=1)
-    total_mae = np.mean(np.abs(pred_total - true_total))
-    total_rmse = np.sqrt(np.mean((pred_total - true_total) ** 2))
-    
-    # Average subscale metrics
-    avg_subscale_mae = np.mean(subscale_mae)
-    avg_subscale_rmse = np.mean(subscale_rmse)
-    
-    return {
-        'subscale_mae': subscale_mae.tolist(),
-        'subscale_rmse': subscale_rmse.tolist(),
-        'avg_subscale_mae': avg_subscale_mae,
-        'avg_subscale_rmse': avg_subscale_rmse,
-        'total_mae': total_mae,
-        'total_rmse': total_rmse
-    }
+    return validated[:13]
 
 
-def evaluate_llm_zero_shot(data: List[Dict], model_name: str = "Qwen3-14B"):
-    """
-    Evaluate LLM in zero-shot setting.
+def remove_json_comments(json_str: str) -> str:
+    json_str = re.sub(r'```json\s*', '', json_str)
+    json_str = re.sub(r'```\s*$', '', json_str, flags=re.MULTILINE)
+
+    lines = []
+    in_string = False
+    escape_next = False
     
-    This is a placeholder function. In practice, you would:
-    1. Load the LLM model (e.g., using transformers or vLLM)
-    2. Create prompts for each sample
-    3. Generate predictions
-    4. Parse the outputs to extract scores
+    for line in json_str.split('\n'):
+        cleaned_line = []
+        i = 0
+        while i < len(line):
+            char = line[i]
+            
+            if escape_next:
+                cleaned_line.append(char)
+                escape_next = False
+                i += 1
+                continue
+            
+            if char == '\\':
+                cleaned_line.append(char)
+                escape_next = True
+                i += 1
+                continue
+            
+            if char == '"':
+                in_string = not in_string
+                cleaned_line.append(char)
+                i += 1
+                continue
+            
+            if not in_string and i < len(line) - 1 and line[i:i+2] == '//':
+                break
+            
+            cleaned_line.append(char)
+            i += 1
+        
+        lines.append(''.join(cleaned_line))
+    
+    return '\n'.join(lines)
+
+
+def extract_scores_from_json(text: str):
+    try:
+        json_match = re.search(r'\{[^{}]*"scores"[^{}]*\[.*?\][^{}]*\}', text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            json_str = remove_json_comments(json_str)
+            try:
+                result = json.loads(json_str)
+                if 'scores' in result and isinstance(result['scores'], list):
+                    scores = [int(s) for s in result['scores']]
+                    if len(scores) >= 13:
+                        return validate_scores(scores[:13])
+                    elif len(scores) > 0:
+                        scores = scores + [0] * (13 - len(scores))
+                        return validate_scores(scores)
+            except json.JSONDecodeError:
+                pass
+        
+        scores_start = text.find('"scores"')
+        if scores_start != -1:
+            bracket_start = text.find('[', scores_start)
+            if bracket_start != -1:
+                bracket_count = 0
+                bracket_end = bracket_start
+                for i in range(bracket_start, len(text)):
+                    if text[i] == '[':
+                        bracket_count += 1
+                    elif text[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            bracket_end = i
+                            break
+                
+                if bracket_end > bracket_start:
+                    array_content = text[bracket_start + 1:bracket_end]
+                    numbers = re.findall(r'\b(\d+)\b', array_content)
+                    if numbers:
+                        scores = [int(n) for n in numbers]
+                        if len(scores) >= 13:
+                            return validate_scores(scores[:13])
+                        elif len(scores) > 0:
+                            scores = scores + [0] * (13 - len(scores))
+                            return validate_scores(scores)
+        
+        array_match = re.search(r'\[[\d\s,//\-\u4e00-\u9fff]*\]', text)
+        if array_match:
+            array_str = array_match.group(0)
+            numbers = re.findall(r'\b(\d+)\b', array_str)
+            if numbers:
+                scores = [int(n) for n in numbers]
+                if len(scores) >= 13:
+                    return validate_scores(scores[:13])
+                elif len(scores) > 0:
+                    scores = scores + [0] * (13 - len(scores))
+                    return validate_scores(scores)
+        
+        print(f'Warning: Failed to extract scores from text: {text[:300]}...')
+        return [0] * 13
+        
+    except Exception as e:
+        print(f'Error extracting scores: {e}')
+        print(f'Text: {text[:300]}...')
+        return [0] * 13
+
+
+def evaluate_llm_zero_shot(data: List[Dict], model_name: str = "Qwen3-14B", dataset_name: str = "cidh"):
+    """
+    Evaluate LLM in zero-shot setting using vLLM server.
     
     Args:
         data: List of samples with transcript and scores
         model_name: Name of the LLM to evaluate
+        dataset_name: Dataset name for prompt formatting
     
     Returns:
-        Dictionary with predictions and metrics
+        Dictionary with predictions and sample_ids
     """
     print(f"Evaluating {model_name} in zero-shot setting...")
-    print(f"Note: This is a placeholder. Implement actual LLM inference here.")
+    print(f"Using vLLM server at http://localhost:8001/v1")
     
-    # Placeholder: Return random predictions for demonstration
-    # In practice, replace this with actual LLM inference
     predictions = []
-    ground_truth = []
+    sample_ids = []
+    error_count = 0
     
-    for sample in tqdm(data, desc="Evaluating"):
-        # Get ground truth
-        if 'scores' in sample:
-            scores = sample['scores']
-        elif 'subscales' in sample:
-            scores = sample['subscales']
-        else:
+    for idx, sample in enumerate(tqdm(data, desc="Evaluating")):
+        # Get sample ID
+        sample_id = sample.get('id', sample.get('sample_id', f"sample_{idx}"))
+        sample_ids.append(sample_id)
+        
+        # Get transcript
+        transcript = sample.get('transcript', '')
+        if not transcript:
+            print(f'Warning: Sample {sample_id} has no transcript, using default scores')
+            predictions.append([0] * 13)
             continue
         
-        # Ensure 13 scores
-        if len(scores) != 13:
-            scores = scores[:13] + [0] * (13 - len(scores))
+        # Create prompt
+        prompt_text = create_prompt(transcript, dataset_name)
         
-        ground_truth.append(scores)
-        
-        # Placeholder prediction (replace with actual LLM inference)
-        # For demonstration, use a simple heuristic or random values
-        # In practice, you would:
-        # 1. Create a prompt from the transcript
-        # 2. Call the LLM API or model
-        # 3. Parse the response to extract HAMD-13 scores
-        pred_scores = [max(0, min(4, int(s + np.random.normal(0, 0.5)))) for s in scores]
-        predictions.append(pred_scores)
+        try:
+            # Call OpenAI API (vLLM server)
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant specialized in mental health assessment."},
+                    {"role": "user", "content": prompt_text},
+                ],
+                extra_body={
+                    "chat_template_kwargs": {
+                        "enable_thinking": False
+                    }
+                },
+                stream=False,
+                temperature=0.1,
+                max_tokens=500,
+            )
+            
+            answer = response.choices[0].message.content
+            
+            if answer is None or not isinstance(answer, str):
+                print(f'Warning: Sample {sample_id} received None or non-string answer.')
+                pred_scores = [0] * 13
+            else:
+                pred_scores = extract_scores_from_json(answer)
+            
+            predictions.append(pred_scores)
+            
+        except Exception as e:
+            error_count += 1
+            print(f'Error processing sample {sample_id}: {e}')
+            predictions.append([0] * 13)
     
-    # Calculate metrics
-    metrics = calculate_mae_rmse(predictions, ground_truth)
+    if error_count > 0:
+        print(f'\nWarning: {error_count} samples encountered errors during inference.')
     
     return {
         'predictions': predictions,
-        'ground_truth': ground_truth,
-        'metrics': metrics
+        'sample_ids': sample_ids
     }
 
 
-def create_prompt(transcript: str, dataset_name: str = "evaluatetape"):
+def create_prompt(transcript: str, dataset_name: str = "cidh"):
     """
     Create a prompt for LLM evaluation.
     
@@ -156,7 +276,7 @@ def create_prompt(transcript: str, dataset_name: str = "evaluatetape"):
     Returns:
         Formatted prompt string
     """
-    if dataset_name.lower() == "evaluatetape":
+    if dataset_name.lower() == "cidh":
         # Summarized format - transcript already contains subscale descriptions
         prompt = f"""请根据以下患者访谈摘要，评估HAMD-13量表的13个子量表分数。
 
@@ -212,84 +332,74 @@ def create_prompt(transcript: str, dataset_name: str = "evaluatetape"):
     return prompt
 
 
+def save_results_to_excel(results: Dict, output_path: str):
+    """
+    Save prediction results to Excel file.
+    Only contains sample ID and 13 prediction scores.
+    
+    Args:
+        results: Dictionary containing predictions and sample_ids
+        output_path: Path to save the Excel file
+    """
+    predictions = results['predictions']
+    sample_ids = results['sample_ids']
+    
+    # Create DataFrame with sample ID and 13 prediction scores
+    data = {
+        'Sample_ID': sample_ids
+    }
+    
+    # Add 13 subscale predictions
+    for i, name in enumerate(SUBSCALE_NAMES):
+        data[name] = [pred[i] for pred in predictions]
+    
+    df = pd.DataFrame(data)
+    
+    # Save to Excel
+    df.to_excel(output_path, index=False, engine='openpyxl')
+    
+    print(f"\nResults saved to Excel: {output_path}")
+    print(f"Total samples: {len(sample_ids)}")
+    print(f"Columns: Sample_ID + {len(SUBSCALE_NAMES)} subscale predictions")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate LLMs on HAMD-13 datasets")
-    parser.add_argument("--dataset", type=str, default="evaluatetape",
-                       choices=["evaluatetape", "pdch"],
+    parser.add_argument("--dataset", type=str, default="cidh",
+                       choices=["cidh", "pdch"],
                        help="Dataset name")
-    parser.add_argument("--split", type=str, default="test",
-                       choices=["train", "val", "test"],
-                       help="Data split to evaluate")
     parser.add_argument("--model", type=str, default="Qwen3-14B",
                        help="LLM model name")
     parser.add_argument("--output", type=str, default=None,
-                       help="Output file path for results")
+                       help="Output Excel file path for results")
     
     args = parser.parse_args()
     
     # Load data
-    print(f"Loading {args.dataset} dataset ({args.split} split)...")
-    data = load_hamd13_data(args.dataset, args.split)
-    print(f"Loaded {len(data)} samples")
+    print(f"Loading {args.dataset} dataset (all data)...")
+    try:
+        data = load_hamd13_data(args.dataset)
+        print(f"Loaded {len(data)} samples")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
     
     # Evaluate LLM
-    results = evaluate_llm_zero_shot(data, args.model)
+    results = evaluate_llm_zero_shot(data, args.model, args.dataset)
     
-    # Print results
-    print("\n" + "="*70)
-    print(f"Evaluation Results: {args.model} on {args.dataset} ({args.split})")
-    print("="*70)
-    print(f"\nAverage Subscale MAE: {results['metrics']['avg_subscale_mae']:.4f}")
-    print(f"Average Subscale RMSE: {results['metrics']['avg_subscale_rmse']:.4f}")
-    print(f"Total Score MAE: {results['metrics']['total_mae']:.4f}")
-    print(f"Total Score RMSE: {results['metrics']['total_rmse']:.4f}")
-    
-    print("\nPer-subscale MAE:")
-    subscale_names = [
-        "Guilt", "Suicide", "Insomnia_Initial", "Insomnia_Middle", "Insomnia_Late",
-        "Work_Interests", "Psychic_Anxiety", "GI_Symptoms", "Somatic_Symptoms",
-        "Genital_Symptoms", "Hypochondriasis", "Weight_Loss", "Insight"
-    ]
-    for i, (name, mae) in enumerate(zip(subscale_names, results['metrics']['subscale_mae'])):
-        print(f"  {i+1:2d}. {name:20s}: {mae:.4f}")
-    
-    # Save results
+    # Save results to Excel
     if args.output:
-        output_data = {
-            'dataset': args.dataset,
-            'split': args.split,
-            'model': args.model,
-            'num_samples': len(data),
-            'metrics': results['metrics'],
-            'predictions': results['predictions'],
-            'ground_truth': results['ground_truth']
-        }
-        with open(args.output, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-        print(f"\nResults saved to: {args.output}")
+        output_path = args.output
     else:
         # Default output path
-        output_path = f"llm_results_{args.model}_{args.dataset}_{args.split}.json"
-        output_data = {
-            'dataset': args.dataset,
-            'split': args.split,
-            'model': args.model,
-            'num_samples': len(data),
-            'metrics': results['metrics'],
-            'predictions': results['predictions'],
-            'ground_truth': results['ground_truth']
-        }
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-        print(f"\nResults saved to: {output_path}")
+        output_path = f"predictions_{args.model}_{args.dataset}.xlsx"
+    
+    save_results_to_excel(results, output_path)
     
     print("\n" + "="*70)
-    print("Note: This script currently uses placeholder predictions.")
-    print("To use actual LLM inference, implement the evaluate_llm_zero_shot function")
-    print("with your LLM API or model loading code.")
+    print("Evaluation completed!")
     print("="*70)
 
 
 if __name__ == "__main__":
     main()
-
